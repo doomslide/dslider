@@ -63,9 +63,11 @@ def fit_dirichlet(
         error = digamma_alpha - psi_S - target_values
         error_norm = jnp.linalg.norm(error, axis=-1)
         new_converged = converged | (error_norm < tol)
-        lr = initial_lr * jnp.exp(-decay_alpha * (step ** decay_nu)) * jnp.abs(
+        exp_factor = jnp.exp(-decay_alpha * (step ** decay_nu))
+        cos_factor = jnp.abs(
             jnp.cos(decay_beta / (step ** decay_gamma))
         )
+        lr = initial_lr *  * 
         lr = jnp.maximum(lr, min_lr)
         delta_alpha = halley_update(alpha, target_values)
         scaled_delta_alpha = lr[..., None] * delta_alpha
