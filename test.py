@@ -1,8 +1,7 @@
 import jax
 import jax.numpy as jnp
-from flax.training.common_utils import shard
-from transformers import FlaxAutoModelForCausalLM, AutoTokenizer
-from huggingface_hub import login
+from transformers import FlaxAutoModelForCausalLM, AutoTokenizer, AutoConfig
+import os
 
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple, NamedTuple
@@ -12,9 +11,19 @@ import json
 from dataclasses import asdict
 from tqdm.auto import tqdm
 from dir_sampler import create_sampler, ADSConfig, ADSState, adaptive_dirichlet_step
+from rich import print
+import psutil
 
 HF_TOKEN = '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'
 CACHE_DIR = '/home/cloudforest/Weights'
+import warnings
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', message='.*unhashable type.*')
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.7'
+jax.config.update('jax_platform_name', 'gpu')
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['JAX_PLATFORMS'] = '' 
 
 class GenerationMetrics(NamedTuple):
     """Metrics collected during generation"""
@@ -49,9 +58,10 @@ def generate_sequence_step(
         config
     )
     
-    # Update sequence
-    output_ids = jnp.concatenate([output_ids, token[None, None]], axis=1)
-    attention_mask = jnp.concatenate([attention_mask, jnp.ones((1, 1), dtype=jnp.int32)], axis=1)
+    # Update the sequences in place
+    curr_seq_len = output_ids.shape[1]
+    new_output_ids = output_ids.at[:, -1].set(token)
+    new_attention_mask = attention_mask.at[:, -1].set(1)
     
     # Collect metrics
     metrics = GenerationMetrics(
@@ -59,11 +69,11 @@ def generate_sequence_step(
         cross_ents=new_state.emwa_cross_ent,
         entropies=new_state.emwa_entropy,
         dir_ents=new_state.emwa_dir_ent,
-        generation_time=0.0,  # hf_KiGgljxzcqpbXkiJiyuHQySrOermsPtTeWWill be updated later
-        output_ids=output_ids
+        generation_time=0.0,
+        output_ids=new_output_ids
     )
     
-    return (output_ids, attention_mask, new_state, key), metrics
+    return (new_output_ids, new_attention_mask, new_state, key), metrics
 
 @partial(jax.jit, static_argnames=('model', 'max_new_tokens'))
 def generate_sequence(
@@ -77,11 +87,16 @@ def generate_sequence(
 ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
     """Generate sequence with JIT-compiled steps."""
     
+    # Start with just the input sequence
     init_carry = (input_ids, attention_mask, state, key)
+    
+    def scan_fn(carry, _):
+        output_ids, attn_mask, state, key = carry
+        return generate_sequence_step(carry, None, model, config, max_new_tokens)
     
     # Use scan for efficient iteration
     (final_output_ids, _, final_state, _), metrics = jax.lax.scan(
-        lambda c, _: generate_sequence_step(c, None, model, config, max_new_tokens),
+        scan_fn,
         init_carry,
         None,
         length=max_new_tokens
@@ -94,150 +109,142 @@ def generate_sequence(
         "dir_ents": metrics.dir_ents,
         "output_ids": metrics.output_ids
     }
-
 def create_test_suite(
-    model_name: str = "gpt2",
-    cache_dir: str = CACHE_DIR,
+    model: FlaxAutoModelForCausalLM,
+    bsz: int,
+    tokenizer: AutoTokenizer,
     num_samples: int = 5,
     sequence_length: int = 100,
-    prompt: str = "In a magical forest,",
-    configs: Optional[Dict[str, ADSConfig]] = None
-):
-    """Create a test suite for the Adaptive Dirichlet Sampler."""
+    prompt: str = "In a magical forest,"
+) -> Dict[str, Any]:
+    print("\n" + "="*80)
+    print(f"Test Configuration:")
+    print(f"Batch size: {bsz}")
+    print(f"Number of samples: {num_samples}")
+    print(f"Sequence length: {sequence_length}")
+    print(f"Prompt: '{prompt}'")
+    print("="*80 + "\n")
+
+    # Create samplers and configs (keeping your existing config)
+    configs = {
+        "standard": ADSConfig(
+            emwa_logp_base=0.99,
+            emwa_logp_exp_factor=1.0,
+            emwa_dir_coeff=0.99,
+            emwa_temp_coeff=0.99,
+            emwa_dir_ent_coeff=0.99,
+            emwa_entropy_coeff=0.99,
+            emwa_cross_ent_coeff=0.99,
+            perturb_base_coeff=0.99,
+            perturb_exp_coeff=1.0,
+            probs_ent_offset=0.1,
+            dir_ent_offset=0.1,
+            entropy_a=0.5,
+            entropy_b=0.3,
+            dirichlet_d=0.5,
+            dirichlet_e=0.3
+        )
+    }
     
-    # Load model and tokenizer
-    print(f"Loading model {model_name}...")
-    model = FlaxAutoModelForCausalLM.from_pretrained(
-        model_name,
-        cache_dir=cache_dir,
-        token=HF_TOKEN
-    )
-    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
-    
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    
-    # Create default configs if none provided
-    if configs is None:
-        configs = {
-            "standard": ADSConfig(),
-            "high_entropy": ADSConfig(
-                entropy_a=0.7,
-                entropy_b=0.5,
-                probs_ent_offset=0.2,
-                dir_ent_offset=0.2,
-                dirichlet_d=0.7,
-                dirichlet_e=0.5
-            ),
-            "low_entropy": ADSConfig(
-                entropy_a=0.3,
-                entropy_b=0.1,
-                probs_ent_offset=0.05,
-                dir_ent_offset=0.05,
-                dirichlet_d=0.3,
-                dirichlet_e=0.1
-            )
-        }
-    
-    # Initialize samplers
     print("Initializing samplers...")
     samplers = {
-        name: create_sampler(1, model.config.vocab_size, config)
+        name: create_sampler(bsz, model.config.vocab_size, config)
         for name, config in configs.items()
     }
     
-    # Pre-compile generation function
-    generate_fn = partial(
-        generate_sequence,
-        model,
-        max_new_tokens=sequence_length
-    )
+    results = {}
     
-    # Warm up JIT compilation
-    print("Warming up JIT compilation...")
-    dummy_input = tokenizer("test", return_tensors="jax", padding=True)
-    _, dummy_state = samplers["standard"]
-    _ = generate_fn(
-        dummy_input.input_ids,
-        dummy_input.attention_mask,
-        dummy_state,
-        jax.random.PRNGKey(0),
-        configs["standard"]
-    )
+    input_ids = tokenizer(prompt, return_tensors="jax").input_ids
+    attention_mask = jnp.ones_like(input_ids)
     
-    def run_test(name: str):
-        print(f"\nRunning test for {name}...")
-        config = configs[name]
-        _, state = samplers[name]
+    for name, (sampler, state) in samplers.items():
+        print(f"\n{'='*40} Testing {name} configuration {'='*40}")
+        samples = []
+        metrics = []
         
-        all_metrics = []
-        generated_texts = []
+        for i in range(num_samples):
+            jax.clear_caches()
+            key = jax.random.PRNGKey(i)
+            
+            try:
+                output_ids, generation_metrics = generate_sequence(
+                    model=model,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    state=state,
+                    key=key,
+                    config=configs[name],
+                    max_new_tokens=sequence_length
+                )
+                
+                text = tokenizer.decode(output_ids[0])
+                samples.append(text)
+                metrics.append(generation_metrics)
+                
+                print(f"\n----- Sample {i+1} -----")
+                print(f"Generated text: {text[:200]}...")
+                print("\nMetrics:")
+                print(f"  Temperature: {jnp.mean(generation_metrics['temperatures']):.3f}")
+                print(f"  Entropy: {jnp.mean(generation_metrics['entropies']):.3f}")
+                print(f"  Cross Entropy: {jnp.mean(generation_metrics['cross_ents']):.3f}")
+                print(f"  Dirichlet Entropy: {jnp.mean(generation_metrics['dir_ents']):.3f}")
+                
+            except Exception as e:
+                print(f"\nError generating sample {i+1}:")
+                print(f"  {str(e)}")
+                continue
         
-        for i in tqdm(range(num_samples)):
-            # Prepare input
-            model_inputs = tokenizer(prompt, return_tensors="jax", padding=True)
-            
-            # Generate
-            start_time = time.time()
-            output_ids, metrics = generate_fn(
-                model_inputs.input_ids,
-                model_inputs.attention_mask,
-                state,
-                jax.random.PRNGKey(i),
-                config
-            )
-            generation_time = time.time() - start_time
-            
-            # Process outputs
-            output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-            generated_texts.append(output_text)
-            
-            # Collect metrics
-            metrics["generation_time"] = generation_time
-            all_metrics.append(metrics)
-            
-            # Print results
-            print(f"\nSample {i+1}:")
-            print(output_text)
-            print(f"Generation time: {generation_time:.2f}s")
-            print(f"Average temperature: {np.mean(metrics['temperatures']):.3f}")
-            print(f"Average cross entropy: {np.mean(metrics['cross_ents']):.3f}")
-            print(f"Average entropy: {np.mean(metrics['entropies']):.3f}")
-            print(f"Average Dirichlet entropy: {np.mean(metrics['dir_ents']):.3f}")
-        
-        return {
-            "config": asdict(config),
-            "metrics": all_metrics,
-            "generated_texts": generated_texts
-        }
-    
-    # Run all configurations
-    results = {
-        name: run_test(name)
-        for name in configs.keys()
-    }
-    
-    # Print comparative analysis
-    print("\nComparative Analysis:")
-    print("=" * 50)
-    
-    for name, result in results.items():
-        metrics = result["metrics"]
+        # Print summary statistics for this configuration
+        print(f"\n{'-'*40} Summary for {name} {'-'*40}")
         avg_metrics = {
-            k: float(np.mean([m[k] for m in metrics]))
-            for k in ["generation_time", "temperatures", "cross_ents", "entropies", "dir_ents"]
+            key: jnp.mean(jnp.array([m[key] for m in metrics])) 
+            for key in ['temperatures', 'entropies', 'cross_ents', 'dir_ents']
         }
+        print("\nAverage Metrics Across All Samples:")
+        for metric, value in avg_metrics.items():
+            print(f"  {metric}: {float(value):.3f}")
         
-        print(f"\n{name.upper()} Configuration:")
-        for metric_name, value in avg_metrics.items():
-            print(f"Average {metric_name}: {value:.3f}")
+        results[name] = {
+            "samples": samples,
+            "metrics": metrics,
+            "average_metrics": avg_metrics
+        }
     
     return results
 
+def print_memory_usage():
+    process = psutil.Process()
+    print(f"Memory usage: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+
+print("Loading model gpt2...")
+tokenizer = AutoTokenizer.from_pretrained("gpt2", cache_dir=CACHE_DIR)
+
+# Modify the model loading section
+model = FlaxAutoModelForCausalLM.from_pretrained(
+    "gpt2",
+    cache_dir=CACHE_DIR,
+    dtype=jnp.float32,  # Explicitly request float32
+    _do_init=True  # Make sure the model is initialized
+)
+
+# Clear memory after loading
+jax.clear_caches()
+
+print("\nMemory before first inference:")
+print_memory_usage()
+
+# Fix the model inference call
+test_input = jnp.ones((1, 2), dtype=jnp.int32)
+_ = model(input_ids=test_input, attention_mask=jnp.ones_like(test_input))  # Add attention mask
+
+print("\nMemory after first inference:")
+print_memory_usage()
+
 if __name__ == "__main__":
     results = create_test_suite(
-        model_name="meta-llama/Llama-3.2-1B",
-        cache_dir=CACHE_DIR,
+        model=model,
+        bsz=1,
+        tokenizer=tokenizer,
         num_samples=5,
         sequence_length=100,
         prompt="In a magical forest,"

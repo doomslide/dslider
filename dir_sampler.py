@@ -5,6 +5,7 @@ from functools import partial
 from typing import NamedTuple, Tuple, Optional
 import chex
 from utils import temp_tune, fit_dirichlet
+from rich import print
 
 class ADSState(NamedTuple):
     """State maintained by the Adaptive Dirichlet Sampler"""
@@ -81,12 +82,12 @@ def update_emwa_logp(
 def initialize_state(bsz: int, vocab_size: int, config: ADSConfig) -> ADSState:
     """Initialize the state for the Adaptive Dirichlet Sampler."""
     return ADSState(
-        emwa_dir=jnp.zeros((bsz, vocab_size)),
-        emwa_logp=jnp.zeros((bsz, vocab_size)),
-        emwa_temp=jnp.ones((bsz,)),
-        emwa_cross_ent=jnp.zeros((bsz,)),
-        emwa_dir_ent=jnp.zeros((bsz,)),
-        emwa_entropy=jnp.zeros((bsz,))
+        emwa_dir=jnp.ones((bsz, vocab_size)),  # [batch_size, vocab_size]
+        emwa_logp=jnp.zeros((bsz, vocab_size)),  # [batch_size, vocab_size]
+        emwa_temp=jnp.ones((bsz,)),  # [batch_size,]
+        emwa_cross_ent=jnp.zeros((bsz,)),  # [batch_size,]
+        emwa_dir_ent=jnp.zeros((bsz,)),  # [batch_size,]
+        emwa_entropy=jnp.zeros((bsz,))  # [batch_size,]
     )
 
 @partial(jax.jit, static_argnames=('config',))
@@ -115,7 +116,6 @@ def adaptive_dirichlet_step(
         config.entropy_b * state.emwa_entropy + 
         config.probs_ent_offset
     )
-    print(f'shape of target_entropy: {target_entropy.shape}')
     pre_temp, _, _ = temp_tune(raw_logp, target_entropy)
     pre_temp = pre_temp
     
@@ -159,33 +159,36 @@ def adaptive_dirichlet_step(
     
     # 9. Sample token and update entropy
     token = jax.random.categorical(key2, jnp.log(final_probs))
-    entropy_rate = entropy(final_probs)  # Should be shape (batch_size,)
+    entropy_rate = entropy(final_probs)  # Shape: (batch_size,)
     new_emwa_entropy = (
         config.emwa_entropy_coeff * entropy_rate + 
         (1 - config.emwa_entropy_coeff) * state.emwa_entropy
     )
     
-    # 10. Update cross entropy (per spec)
-    token_logprob = -jnp.log(final_probs)[jnp.arange(final_probs.shape[0]), token]  # Get logprob for each batch
+    # 10. Update cross entropy
+    # Get log prob for the sampled token - ensure scalar for each batch
+    token_logprob = -jnp.log(final_probs.reshape(final_probs.shape[0], -1)[jnp.arange(final_probs.shape[0]), token])
+    
+    # Scale by temperature before the moving average
+    scaled_token_logprob = token_logprob / jnp.maximum(new_emwa_temp, 1e-8)
+    
+    # Update the moving average with the scaled value - maintain shape [batch_size,]
     new_emwa_cross_ent = (
-        config.emwa_cross_ent_coeff * (token_logprob / new_emwa_temp) +
+        config.emwa_cross_ent_coeff * scaled_token_logprob + 
         (1 - config.emwa_cross_ent_coeff) * state.emwa_cross_ent
     )
     
-    # Construct new state
+    # Ensure all state variables maintain their original shapes
     new_state = ADSState(
-        emwa_dir=new_emwa_dir,
-        emwa_logp=new_emwa_logp,
-        emwa_temp=new_emwa_temp,
-        emwa_cross_ent=new_emwa_cross_ent,
-        emwa_dir_ent=new_emwa_dir_ent,
-        emwa_entropy=new_emwa_entropy
+        emwa_dir=new_emwa_dir,  # Shape: (batch_size, vocab_size)
+        emwa_logp=new_emwa_logp,  # Shape: (batch_size, vocab_size)
+        emwa_temp=new_emwa_temp,  # Shape: (batch_size,)
+        emwa_cross_ent=new_emwa_cross_ent,  # Shape: (batch_size,)
+        emwa_dir_ent=new_emwa_dir_ent,  # Shape: (batch_size,)
+        emwa_entropy=new_emwa_entropy  # Shape: (batch_size,)
     )
     
     return new_state, token
-
-
-
 
 # Example usage:
 def create_sampler(bsz: int, vocab_size: int, config: Optional[ADSConfig] = None):

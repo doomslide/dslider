@@ -23,23 +23,24 @@ The sampler works as follows:
 3. The emwa of dirichlet parameters is updated: 
     - `emwa_dir = emwa_dir_coeff *  fit_dirichlet(emwa_logp) + (1-emwa_dir_coeff) * emwa_dir` where `fit_dirichlet` is a function that fits dirichlet parameters to the emwa log probabilities. (See below.)
 4. A temperature tuner finds `pre_temp` so that `pre_probs := softmax(raw_logp/pre_temp)` satisfies `entropy(pre_prob) == a * emwa_cross_ent + b * emwa_entropy  + probs_ent_offset` where `0<a, b <1` and `probs_ent_offset > 0` are pretuned hyperparameterss. (See below for details.)
-5. Update emwa temperature: 
+5. Update emwa temperature and entropy: 
     - `emwa_temp = emwa_temp_coeff * pre_temp + (1-emwa_temp_coeff) * emwa_temp`
+    - `emwa_entropy = emwa_entropy_coeff * entropy(pre_probs) + (1-emwa_entropy_coeff) * emwa_entropy`
 6. Compute dirichlet likelihood `dir_likelihood = Dir(pre_probs|emwa_dir)`
 7. Update `emwa_dir_ent = emwa_dir_ent_coeff * (-log(dir_likelihood)) + (1-emwa_dir_ent_coeff) * emwa_dir_ent`
 5. If `-log(dir_likelihood) < d * (-log(Dir(softmax(emwa_logp)|emwa_dir))) + e * emwa_dir_ent + dir_ent_offset`: 
     - `sampled_probs ~ Dir(emwa_dir)` # sample a probability vector from the dirichlet parameters
     - `perturb_factor = 1 - perturb_base_coeff ** (- perturb_exp_coeff/KL(sampled_probs||pre_probs))`
     - `probs = perturb_factor * sampled_probs + (1-perturb_factor) pre_probs` # interpolate
+    - 
 6. otherwise:
     - `probs = pre_probs`
-    - `emwa_entropy = emwa_entropy_coeff * entropy(probs) + (1-emwa_entropy_coeff) * emwa_entropy`
 7. Sample a token `token ~ probs`.
 8. Update emwa of cross entropy:
     - `emwa_cross_ent = emwa_cross_ent_coeff * (-log(probs))[token]/emwa_temp) + (1-emwa_cross_ent_coeff) * emwa_cross_ent`
 6. Append the token to the sequence and put back into the model. 
 
-All hyperparameters are optimized (via grid search or possibly faster alternative) to minimize average `emwa_cross_ent`. 
+All hyperparameters are optimized (via grid search or possibly faster alternative) to minimize `emwa_cross_ent/emwa_entropy`. 
 
 
 Here is the function `temp_tune` which finds temperature to fit a given entropy target:
@@ -191,33 +192,3 @@ def fit_dirichlet(
 ```
 
 
-------
-
-"""
-# Adaptive Dirichlet Sampling
-
-The adaptive Dirichlet sampler is a decoding method for language models that uses exponentially moving averages to track and adjust sampling behavior over time.
-
-## State Variables
-The sampler maintains several moving averages:
-- `emwa_dir`: Dirichlet parameters fit to recent token distributions
-- `emwa_logp`: Log probabilities from the language model
-- `emwa_temp`: Temperature used for softmax
-- `emwa_cross_ent`: Cross entropy of sampled tokens
-- `emwa_dir_ent`: Entropy of the Dirichlet distribution
-- `emwa_entropy`: Entropy of the final sampling distribution
-
-## Process
-For each token generation:
-1. Get logits from the language model
-2. Update moving average of log probabilities
-3. Fit and update Dirichlet parameters
-4. Adjust temperature to target entropy level
-5. Either:
-   - Sample from Dirichlet and blend with softmax probabilities
-   - Or use softmax probabilities directly
-6. Sample next token
-7. Update state variables
-
-The sampler aims to maintain diversity in the generated text while staying close to the model's original probability distribution. The moving averages help adapt the sampling behavior based on recent history.
-"""
