@@ -16,12 +16,13 @@ import psutil
 
 HF_TOKEN = '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'
 CACHE_DIR = '/home/cloudforest/Weights'
+jax.config.update('jax_platform_name', 'gpu')
+
 import warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', message='.*unhashable type.*')
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.7'
-jax.config.update('jax_platform_name', 'gpu')
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['JAX_PLATFORMS'] = '' 
 

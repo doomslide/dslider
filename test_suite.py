@@ -1,3 +1,4 @@
+import os
 import jax
 import jax.numpy as jnp
 from functools import partial
@@ -77,14 +78,34 @@ def create_model_fn(model, params):
     return model_fn
 
 def main():
-    from transformers import AutoTokenizer, FlaxAutoModelForCausalLM
+    from transformers import AutoTokenizer, FlaxAutoModelForCausalLM, LlamaConfig
     
-    # Load model and tokenizer
-    model_name = "gpt2"
+    # Verify GPU is available
+    print("JAX devices:", jax.devices())
+    
+    # Load model and tokenizer with memory optimizations
+    model_name = "meta-llama/Llama-3.2-1B"
+    
+    # Create config with smaller context window
+    config = LlamaConfig.from_pretrained(model_name)
+    config.max_position_embeddings = 2048  # Reduce from default (usually 4096 or higher)
+    
+    # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=CACHE_DIR)
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
-    model = FlaxAutoModelForCausalLM.from_pretrained(model_name, cache_dir=CACHE_DIR)
+        
+    # Load model with reduced context length
+    model = FlaxAutoModelForCausalLM.from_pretrained(
+        model_name,
+        config=config,
+        cache_dir=CACHE_DIR,
+        _do_init=True,
+        from_pt=False
+    )
+    
+    # Clear JAX cache after loading
+    jax.clear_caches()
     
     # Create model function
     model_fn = create_model_fn(model, model.params)
