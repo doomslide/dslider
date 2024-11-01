@@ -212,40 +212,40 @@ def create_test_suite(
     
     return results
 
-def print_memory_usage():
-    process = psutil.Process()
-    print(f"Memory usage: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+# def print_memory_usage():
+#     process = psutil.Process()
+#     print(f"Memory usage: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
-print("Loading model gpt2...")
-tokenizer = AutoTokenizer.from_pretrained("gpt2", cache_dir=CACHE_DIR)
+# print("Loading model gpt2...")
+# tokenizer = AutoTokenizer.from_pretrained("gpt2", cache_dir=CACHE_DIR)
 
-# Modify the model loading section
-model = FlaxAutoModelForCausalLM.from_pretrained(
-    "gpt2",
-    cache_dir=CACHE_DIR,
-    dtype=jnp.float32,  # Explicitly request float32
-    _do_init=True  # Make sure the model is initialized
-)
+# # Modify the model loading section
+# model = FlaxAutoModelForCausalLM.from_pretrained(
+#     "gpt2",
+#     cache_dir=CACHE_DIR,
+#     dtype=jnp.float32,  # Explicitly request float32
+#     _do_init=True  # Make sure the model is initialized
+# )
 
-# Clear memory after loading
-jax.clear_caches()
+# # Clear memory after loading
+# jax.clear_caches()
 
-print("\nMemory before first inference:")
-print_memory_usage()
+# print("\nMemory before first inference:")
+# print_memory_usage()
 
-# Fix the model inference call
-test_input = jnp.ones((1, 2), dtype=jnp.int32)
-_ = model(input_ids=test_input, attention_mask=jnp.ones_like(test_input))  # Add attention mask
+# # Fix the model inference call
+# test_input = jnp.ones((1, 2), dtype=jnp.int32)
+# _ = model(input_ids=test_input, attention_mask=jnp.ones_like(test_input))  # Add attention mask
 
-print("\nMemory after first inference:")
-print_memory_usage()
+# print("\nMemory after first inference:")
+# print_memory_usage()
 
-if __name__ == "__main__":
-    results = create_test_suite(
-        model=model,
-        bsz=1,
-        tokenizer=tokenizer,
-        num_samples=5,
-        sequence_length=100,
-        prompt="In a magical forest,"
-    )
+# if __name__ == "__main__":
+#     results = create_test_suite(
+#         model=model,
+#         bsz=1,
+#         tokenizer=tokenizer,
+#         num_samples=5,
+#         sequence_length=100,
+#         prompt="In a magical forest,"
+#     )

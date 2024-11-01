@@ -29,7 +29,7 @@ The sampler works as follows:
 6. Compute dirichlet likelihood `dir_likelihood = Dir(pre_probs|emwa_dir)`
 7. Update `emwa_dir_ent = emwa_dir_ent_coeff * (-log(dir_likelihood)) + (1-emwa_dir_ent_coeff) * emwa_dir_ent`
 5. If `-log(dir_likelihood) < d * (-log(Dir(softmax(emwa_logp)|emwa_dir))) + e * emwa_dir_ent + dir_ent_offset`: 
-    - `sampled_probs ~ Dir(emwa_dir)` # sample a probability vector from the dirichlet parameters
+    - `sampled_probs ~ Dir(emwa_dir)` # sample a probability vector from the dirichlet parameters (or take `E[p|emwa_dir]`)
     - `perturb_factor = 1 - perturb_base_coeff ** (- perturb_exp_coeff/KL(sampled_probs||pre_probs))`
     - `probs = perturb_factor * sampled_probs + (1-perturb_factor) pre_probs` # interpolate
     - 
