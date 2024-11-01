@@ -190,12 +190,14 @@ def adaptive_dirichlet_step(
         new_emwa_logp,
         new_emwa_dir
     )
-    dir_log_likelihood = dirichlet_log_likelihood_from_logprob(naked_logprobs, new_emwa_dir)
+    dir_log_likelihood = dirichlet_log_likelihood_from_logprob(naked_logprobs, state.emwa_dir)
     new_emwa_dir_ent = (
         config.emwa_dir_ent_coeff * (-dir_log_likelihood) + 
         (1 - config.emwa_dir_ent_coeff) * state.emwa_dir_ent
     )
-    
+
+    # logprob level
+
     # 7. Determine whether to use Dirichlet
     dir_threshold = (
         config.dirichlet_d * (-baseline_log_likelihood) +
@@ -205,7 +207,7 @@ def adaptive_dirichlet_step(
     use_dirichlet = (-dir_log_likelihood < dir_threshold)[..., None] 
     
     # 8. Interpolate if using Dirichlet
-    dirichlet_expected_probs = dirichlet_expectation(new_emwa_dir)
+    dirichlet_expected_probs = dirichlet_expectation(state.emwa_dir)
     perturb_coeff = 1 - config.perturb_base_coeff ** (-config.perturb_exp_coeff / (kl_divergence(dirichlet_expected_probs, naked_probs) + EPS))
     final_probs = jnp.where(use_dirichlet, perturb_coeff * dirichlet_expected_probs + (1 - perturb_coeff) * naked_probs, naked_probs)
     
@@ -217,19 +219,19 @@ def adaptive_dirichlet_step(
         (1 - config.entropy_rate_scaffold_coeff) * state.entropy_rate_scaffold
     )
     
-    # 10. Update cross entropy
-    # Get log prob for the sampled token using advanced indexing
+    # 10. Compute token log likelihood
     batch_indices = jnp.arange(bsz)
     final_token_logprob = jnp.log(final_probs[batch_indices, token_ids])  # Shape: (batch_size,)
     naked_token_logprob = naked_logprobs[batch_indices, token_ids]  # Shape: (batch_size,)
-    
-    # Update the moving average with the scaled value
+
+    # token level:
+        # TODO: compare (-naked_token_logprob) vs naked_token_cross_ent, (-scaffold_token_logprob) vs scaffold_token_cross_ent
+        # treat sensibly each of the 4 cases.
+
     new_token_cross_ent_scaffold = (
         config.token_cross_ent_scaffold_coeff * (-final_token_logprob) + 
         (1 - config.token_cross_ent_scaffold_coeff) * state.token_cross_ent_scaffold
     )
-
-    # Update exponential moving weighted average of -raw_logp[token]
     new_token_cross_ent_naked = (
         config.token_cross_ent_naked_coeff * (-naked_token_logprob) +
         (1 - config.token_cross_ent_naked_coeff) * state.token_cross_ent_naked
