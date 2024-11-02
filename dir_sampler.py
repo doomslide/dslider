@@ -5,11 +5,8 @@ from functools import partial
 from typing import NamedTuple, Tuple
 from utils import temp_tune, fit_dirichlet
 from rich import print
-from dataclasses import dataclass
-# Constants
-MIN_TEMP = 1e-4
-MAX_TEMP = 1e4
-EPS = 1e-8
+from config import ADSConfig, EPS, MIN_TEMP, MAX_TEMP
+
 
 class ADSState(NamedTuple):
     """State maintained by the Adaptive Dirichlet Sampler"""
@@ -21,30 +18,7 @@ class ADSState(NamedTuple):
     emwa_dir_ent: jnp.ndarray
     entropy_rate_scaffold: jnp.ndarray
     entropy_rate_naked: jnp.ndarray
-    
-
-@dataclass(frozen=True)
-class ADSConfig:
-    emwa_logp_base: float
-    emwa_logp_exp_factor: float
-    emwa_dir_coeff: float
-    emwa_temp_coeff: float
-    emwa_dir_ent_coeff: float
-    entropy_rate_scaffold_coeff: float
-    entropy_rate_naked_coeff: float
-    token_cross_ent_scaffold_coeff: float
-    perturb_base_coeff: float
-    perturb_exp_coeff: float
-    probs_ent_offset: float
-    dir_ent_offset: float
-    entropy_a: float
-    entropy_b: float
-    entropy_c: float
-    entropy_d: float
-    dirichlet_d: float
-    dirichlet_e: float
-    token_cross_ent_naked_coeff: float
-
+  
 @jax.jit
 def kl_divergence(p: jnp.ndarray, q: jnp.ndarray) -> jnp.ndarray:
     """Compute KL divergence between two probability distributions."""
@@ -125,7 +99,7 @@ def initialize_state(bsz: int, vsz: int, dtype=jnp.bfloat16) -> ADSState:
     )
     return state
 
-@partial(jax.jit, static_argnums=(3,)) 
+@partial(jax.jit, static_argnames=('config',))
 def adaptive_dirichlet_step(
     key: jax.random.PRNGKey,
     state: ADSState,

@@ -12,9 +12,6 @@ from transformers import (
 )
 from functools import partial
 
-# Constants
-HF_TOKEN = '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'
-CACHE_DIR = '/home/cloudforest/Weights'
 
 # JAX configuration
 try:
