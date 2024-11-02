@@ -1,46 +1,117 @@
 import jax.numpy as jnp
-from typing import NamedTuple
 from dataclasses import dataclass
 from jax.tree_util import register_pytree_node_class
+import jax 
 
 # Constants
 MIN_TEMP = 1e-4
 MAX_TEMP = 1e4
 EPS = 1e-8
 
+@dataclass(frozen=True)
+class OutlierThreshold:
+    bilinear: jnp.ndarray  # Shape (4, 4)
+    linear_state_ent: jnp.ndarray  # Shape (4,)
+    linear_state_std: jnp.ndarray  # Shape (4,)
+    linear_naked_ent: float
+    linear_naked_std: float
+    linear_naked_varent: float
+    bias: float
+    
+    def tree_flatten(self):
+        """For JAX pytree handling"""
+        children = (self.bilinear, self.linear_state_ent, self.linear_state_std, 
+                   self.linear_naked_ent, self.linear_naked_std, self.linear_naked_varent, self.bias)
+        return children, None
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        """For JAX pytree handling"""
+        return cls(*children)
+
+@dataclass(frozen=True)
+class ArgmaxThreshold:
+    weight: float
+    bias: float
+    
+    def tree_flatten(self):
+        return (self.weight, self.bias), None
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(*children)
+
+@dataclass(frozen=True)
+class DirichletThreshold:
+    weight: float
+    bias: float
+    
+    def tree_flatten(self):
+        return (self.weight, self.bias), None
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(*children)
+
+@dataclass(frozen=True)
+class TargetEntropy:
+    linear: jnp.ndarray  # Shape (4,)
+    linear_inv_temp: jnp.ndarray  # Shape (batch_size,)
+    bias: float
+    
+    def tree_flatten(self):
+        return (self.linear, self.linear_inv_temp, self.bias), None
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(*children)
+
 @dataclass(frozen=True, eq=True)
 class ADSConfig:
+    # EMWA coefficients
     emwa_logp_base: float
     emwa_logp_exp_factor: float
     emwa_dir_coeff: float
     emwa_temp_coeff: float
     emwa_dir_ent_coeff: float
-    entropy_rate_scaffold_coeff: float
-    entropy_rate_naked_coeff: float
+    emwa_ent_scaffold_coeff: float
+    emwa_varent_scaffold_coeff: float
+    emwa_ent_naked_coeff: float
+    emwa_varent_naked_coeff: float
+    emwa_topk_ent_naked_coeff: float
+    
+    # Token cross entropy coefficients
     token_cross_ent_scaffold_coeff: float
+    token_cross_ent_naked_coeff: float
+    token_cross_var_scaffold_coeff: float
+    token_cross_var_naked_coeff: float
+    
+    # Dirichlet parameters
     perturb_base_coeff: float
     perturb_exp_coeff: float
-    probs_ent_offset: float
-    dir_ent_offset: float
-    entropy_a: float
-    entropy_b: float
-    entropy_c: float
-    entropy_d: float
-    dirichlet_a: float
-    dirichlet_b: float
-    token_outlier_threshold: jnp.ndarray 
-    token_cross_ent_naked_coeff: float
-    token_outlier_k: int # still very interesting for k=1
-    token_outlier_emwa_weight: float
-    token_outlier_emwa_bias: float
-    token_outlier_a: float 
-    token_outlier_b: float 
-    token_outlier_c: float 
-    token_outlier_d: float 
-    token_outlier_threshold_bias: float
-
+    dirichlet_support: jnp.ndarray
+    
+    # Threshold parameters
+    outlier_threshold: OutlierThreshold
+    argmax_threshold: ArgmaxThreshold
+    dirichlet_threshold: DirichletThreshold
+    target_entropy: TargetEntropy
+    
+    
+    # Token outlier
+    outlier_topk: int
+    
     def __hash__(self):
-        return hash(tuple(getattr(self, field.name) for field in self.__dataclass_fields__.values()))
+        """Custom hash that handles JAX arrays."""
+        hashable_items = []
+        for field in self.__dataclass_fields__.values():
+            value = getattr(self, field.name)
+            if isinstance(value, (jnp.ndarray, jax.Array)):
+                # Hash array data and shape for arrays
+                hashable_items.append(hash((value.shape, value.dtype)))
+            else:
+                hashable_items.append(hash(value))
+        return hash(tuple(hashable_items))
     
     def tree_flatten(self):
         """For JAX pytree handling"""
@@ -51,39 +122,66 @@ class ADSConfig:
         """For JAX pytree handling"""
         return cls(*children)
 
-register_pytree_node_class(ADSConfig)
 
-# Add default ADS config after the existing constants
+register_pytree_node_class(ADSConfig)
+register_pytree_node_class(OutlierThreshold)
+register_pytree_node_class(ArgmaxThreshold)
+register_pytree_node_class(DirichletThreshold)
+register_pytree_node_class(TargetEntropy)
+
+# Default config values
 DEFAULT_ADS_CONFIG = ADSConfig(
-    emwa_logp_base=1.1,
-    emwa_logp_exp_factor=2.0,
-    emwa_dir_coeff=0.1,
-    emwa_temp_coeff=0.1,
-    emwa_dir_ent_coeff=0.1,
-    entropy_rate_scaffold_coeff=0.1,
-    entropy_rate_naked_coeff=0.1,
-    token_cross_ent_scaffold_coeff=0.1,
-    perturb_base_coeff=0.9,
-    perturb_exp_coeff=2.0,
-    probs_ent_offset=0.0,
-    dir_ent_offset=0.0,
-    entropy_a=1.0,
-    entropy_b=0.0,
-    entropy_c=0.0,
-    entropy_d=0.0,
-    dirichlet_a=1.0,
-    dirichlet_b=0.0,
-    token_cross_ent_naked_coeff=0.1,
-    toekn_outlier_k=3,
-    token_outlier_emwa_weight=0.6,
-    token_outlier_emwa_bias=2.0,
-    token_outlier_a=0.4,
-    token_outlier_b=0.6,
-    token_outlier_c=0.5,
-    token_outlier_d=0.2,
-    token_outlier_threshold_bias=0.3,
+    # EMWA coefficients
+    emwa_logp_base=1.5, 
+    emwa_logp_exp_factor=2.5,  
+    emwa_dir_coeff=0.2, 
+    emwa_temp_coeff=0.15, 
+    emwa_dir_ent_coeff=0.15,  
+    emwa_ent_scaffold_coeff=0.15,
+    emwa_varent_scaffold_coeff=0.15,
+    emwa_ent_naked_coeff=0.15,
+    emwa_varent_naked_coeff=0.15,
+    emwa_topk_ent_naked_coeff=0.15,
+    
+    # Token cross entropy coefficients
+    token_cross_ent_scaffold_coeff=0.15, 
+    token_cross_ent_naked_coeff=0.15,
+    token_cross_var_scaffold_coeff=0.15,
+    token_cross_var_naked_coeff=0.15,
+    
+    # Dirichlet parameters
+    perturb_base_coeff=0.95, 
+    perturb_exp_coeff=2.5, 
+    dirichlet_support=jnp.arange(32000), 
+    
+    # Threshold parameters
+    outlier_threshold=OutlierThreshold(
+        bilinear=jnp.eye(4) * 0.15,  # Increased sensitivity
+        linear_state_ent=jnp.ones(4) * 0.15,
+        linear_state_std=jnp.ones(4) * 0.15,
+        linear_naked_ent=0.15,
+        linear_naked_std=0.15,
+        linear_naked_varent=0.15,
+        bias=0.1  # Added small positive bias
+    ),
+    argmax_threshold=ArgmaxThreshold(
+        weight=1.2,  # Increased from 1.0
+        bias=0.1  # Added small positive bias
+    ),
+    dirichlet_threshold=DirichletThreshold(
+        weight=1.2,  # Increased from 1.0
+        bias=0.1  # Added small positive bias
+    ),
+    target_entropy=TargetEntropy(
+        linear=jnp.ones(4) * 0.15,
+        linear_inv_temp=jnp.ones(1) * 1.2,  # Increased from 1.0
+        bias=0.1  # Added small positive bias
+    ),
+    
+    # Token outlier parameters
+    outlier_topk=3,
 )
 
 CACHE_DIR = '/home/cloudforest/Weights'
-MODEL_NAME = "HuggingFaceTB/SmolLM-360M"
+MODEL_NAME = "gpt2"
 HF_TOKEN = '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'

@@ -32,7 +32,7 @@ def halley_update(alpha, target_values):
     J_inv_H_J_inv_error = temp2 + coeff * sum_temp2 * p1_inv
     return -J_inv_error + 0.5 * J_inv_H_J_inv_error
 
-@partial(jax.jit, static_argnums=(2, 3, 4, 5, 6, 7, 8))
+@partial(jax.jit, static_argnums=(2, 3, 4, 5, 6, 7, 8, 9))
 def fit_dirichlet(
     target_values,
     init_alpha=None,
@@ -42,7 +42,8 @@ def fit_dirichlet(
     decay_gamma=0.25,
     decay_nu=0.75,
     max_iters=140,
-    tol=1e-4
+    tol=1e-4,
+    dtype: jnp.dtype = jnp.bfloat16
 ):
     """
     Estimate Dirichlet parameters (alpha) from target logprobs.
@@ -51,9 +52,9 @@ def fit_dirichlet(
     batch_shape = target_values.shape[:-1]
     n = target_values.shape[-1]
     min_lr = 1e-8
-    
+    target_values = target_values.astype(jnp.float32) # for large vocab size needs float64
     if init_alpha is None:
-        init_alpha = jnp.ones((*batch_shape, n))
+        init_alpha = jnp.ones((*batch_shape, n), dtype=jnp.float32)
     
     def scan_body(carry, _):
         alpha, converged, error_norm, step = carry
@@ -90,7 +91,7 @@ def fit_dirichlet(
         length=max_iters
     )
     
-    return final_alpha, final_step - 1, final_converged
+    return final_alpha.astype(dtype), final_step - 1, final_converged
 
 @jax.jit
 def ent_grad_hess(logits: jnp.ndarray, T: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -102,7 +103,7 @@ def ent_grad_hess(logits: jnp.ndarray, T: jnp.ndarray) -> tuple[jnp.ndarray, jnp
     mu3 = jnp.sum(p * diff**3, axis=-1)
     return -mu1, mu2 / T, -(2 * mu3 + 3 * mu2) / (T * T)
 
-@partial(jax.jit, static_argnums=(3, 4, 5))  
+@partial(jax.jit, static_argnums=(3, 4, 5, 6))  
 def temp_tune(
     logits: jnp.ndarray,
     target_ent: jnp.ndarray,
@@ -110,8 +111,10 @@ def temp_tune(
     lr: float = 0.1,
     max_iters: int = 10,
     tol: float = 1e-6,
+    dtype: jnp.dtype = jnp.bfloat16
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    batch_size = logits.shape[0]    
+    batch_size = logits.shape[0]
+    logits = logits.astype(jnp.float32)  
     def scan_body(carry, _):
         T, iters, converged = carry        
         ent, grad, hess = ent_grad_hess(logits, T)        
@@ -143,7 +146,7 @@ def temp_tune(
         )        
         return (new_T, iters + 1, new_converged), None
     init_state = (
-        jnp.full((batch_size,), T_init, dtype=logits.dtype),
+        jnp.full((batch_size,), T_init, dtype=jnp.float32),
         jnp.zeros(batch_size, dtype=jnp.int32),
         jnp.zeros(batch_size, dtype=jnp.bool_)
     )    
@@ -153,5 +156,5 @@ def temp_tune(
         None,
         length=max_iters
     )
-    return final_T, final_iters, final_converged
+    return final_T.astype(dtype), final_iters, final_converged
 

@@ -3,10 +3,9 @@ import jax.numpy as jnp
 from transformers import AutoTokenizer, FlaxAutoModelForCausalLM, AutoConfig
 from functools import partial
 import time
-from dir_sampler import (
+from dslider import (
     adaptive_dirichlet_step, 
-    initialize_state, 
-    entropy
+    initialize_state
 )
 from rich import print
 from config import ADSConfig, DEFAULT_ADS_CONFIG, CACHE_DIR, MODEL_NAME, EPS
@@ -77,9 +76,21 @@ def get_next_token(params, apply_fn, input_ids, key, temperature=1e-3):
         return jax.random.categorical(key, logits, axis=-1)
     return _get_next_token(params, input_ids, key)
 
-@partial(jax.jit, static_argnames=('apply_fn', 'max_length', 'config', 'vocab_size', 'dtype'))
-def generate_sequence_ads(params, apply_fn, input_ids, key, vocab_size, max_length=20, config=DEFAULT_ADS_CONFIG, dtype=jnp.bfloat16):
+# @partial(jax.jit, static_argnames=('apply_fn', 'max_length', 'vocab_size', 'dtype'))
+def generate_sequence_ads(
+    params, 
+    apply_fn, 
+    input_ids, 
+    key, 
+    vocab_size, 
+    max_length=20, 
+    config=None, 
+    dtype=jnp.bfloat16
+):
     """Generate sequence using adaptive Dirichlet sampling with efficient JAX implementation."""
+    if config is None:
+        config = DEFAULT_ADS_CONFIG
+        
     batch_size = input_ids.shape[0]
     
     # Initialize context buffer with input_ids
@@ -88,7 +99,31 @@ def generate_sequence_ads(params, apply_fn, input_ids, key, vocab_size, max_leng
     
     # Initialize ADS state - pass dtype here
     ads_state = initialize_state(batch_size, vocab_size, config, dtype=dtype)
+    # Test one step of adaptive_dirichlet_step
+    test_key = jax.random.PRNGKey(0)
+    test_logits = jnp.ones((batch_size, vocab_size), dtype=dtype)
     
+    # Run one step and verify outputs
+    test_state, test_tokens, test_naked_ent, test_naked_varent, test_scaffold_ent, test_scaffold_varent, test_naked_logprob, test_scaffold_logprob = adaptive_dirichlet_step(
+        test_key,
+        ads_state,
+        test_logits, 
+        config
+    )
+    
+    # Verify shapes and dtypes
+    assert test_state.emwa_dir.shape == (batch_size, config.dirichlet_support.size)
+    assert test_tokens.shape == (batch_size,), f"test_tokens came out with shape {test_tokens.shape} but batch_size = {batch_size}"
+    assert test_naked_ent.shape == (batch_size,)
+    assert test_naked_varent.shape == (batch_size,)
+    assert test_scaffold_ent.shape == (batch_size,)
+    assert test_scaffold_varent.shape == (batch_size,)
+    assert test_naked_logprob.shape == (batch_size,)
+    assert test_scaffold_logprob.shape == (batch_size,)
+    
+    assert test_state.emwa_dir.dtype == dtype, f"test_state.emwa_dir has dtype: {test_state.emwa_dir.dtype} but input dtype was {dtype}"
+    assert test_naked_ent.dtype == dtype
+    assert test_scaffold_ent.dtype == dtype
     def scan_fn(carry, _):
         context, key, state = carry
         next_key, sample_key = jax.random.split(key)
@@ -97,13 +132,13 @@ def generate_sequence_ads(params, apply_fn, input_ids, key, vocab_size, max_leng
         logits = outputs.logits[:, -1, :]
         
         # Generate next token using ADS
-        new_state, next_token = adaptive_dirichlet_step(sample_key, state, logits, config)
+        new_state, output_token, naked_ent, naked_varent, scaffold_ent, scaffold_varent, naked_token_logprob, scaffold_token_logprob = adaptive_dirichlet_step(sample_key, state, logits, config)
         
         # Shift context buffer and add new token
         new_context = jnp.roll(context, shift=-1, axis=1)
-        new_context = new_context.at[:, -1].set(next_token)
+        new_context = new_context.at[:, -1].set(output_token)
         
-        return (new_context, next_key, new_state), next_token
+        return (new_context, next_key, new_state), output_token
     
     # Run the scan
     _, output_tokens = jax.lax.scan(
@@ -114,34 +149,7 @@ def generate_sequence_ads(params, apply_fn, input_ids, key, vocab_size, max_leng
     
     return output_tokens.T
 
-def analyze_sampling_stats(logits, final_probs, token_id):
-    """Analyze sampling statistics for a single step."""
-    # Convert inputs to bfloat16 for stable computation
-    logits = logits.astype(jnp.bfloat16)
-    final_probs = final_probs.astype(jnp.bfloat16)
-    
-    probs = jax.nn.softmax(logits)
-    entropy_before = entropy(probs)
-    entropy_after = entropy(final_probs)
-    
-    top_k_before = jnp.sort(probs, axis=-1)[...,-5:]
-    top_k_after = jnp.sort(final_probs, axis=-1)[...,-5:]
-    
-    # Get probabilities for the selected token and ensure they're scalar
-    token_prob_before = probs[0, token_id].squeeze()  # Take first batch element and squeeze
-    token_prob_after = final_probs[0, token_id].squeeze()
-    
-    # Ensure all values are scalar
-    return {
-        'entropy_before': float(entropy_before[0]),  # Take first batch element
-        'entropy_after': float(entropy_after[0]),
-        'entropy_diff': float(entropy_after[0] - entropy_before[0]),
-        'top_k_before': top_k_before[0],  # Keep array for top-k
-        'top_k_after': top_k_after[0],
-        'token_prob_before': float(token_prob_before),
-        'token_prob_after': float(token_prob_after),
-        'prob_ratio': float(token_prob_after / (token_prob_before + EPS))
-    }
+
 
 def test_ads_generation(params, apply_fn, input_ids, tokenizer, vocab_size):
     """Test function for ADS generation with detailed analysis."""
@@ -204,36 +212,15 @@ def test_ads_generation(params, apply_fn, input_ids, tokenizer, vocab_size):
             
             # Initialize ADS state for analysis
             ads_state = initialize_state(input_ids.shape[0], vocab_size, DEFAULT_ADS_CONFIG)
-            new_state, token_id = adaptive_dirichlet_step(prng_key, ads_state, logits, DEFAULT_ADS_CONFIG)
+            new_state, token_id, _, _, _, _, _, _ = adaptive_dirichlet_step(prng_key, ads_state, logits, DEFAULT_ADS_CONFIG)
             
             # Get probabilities after ADS transformation
             final_probs = jax.nn.softmax(logits / new_state.emwa_temp[:, None])
-            
-            # Analyze sampling statistics
-            stats = analyze_sampling_stats(logits, final_probs, token_id)
-            
-            print("\nSampling Statistics:")
-            for key, value in stats.items():
-                if isinstance(value, (float, int)):
-                    print(f"{key}: {value:.3f}")
-                elif hasattr(value, 'shape') and len(value.shape) > 0:  # Array values
-                    print(f"{key}:\n{value}")
-                else:
-                    print(f"{key}: {value}")
-            
-            # Get new PRNG key for next iteration
-            prng_key = jax.random.fold_in(prng_key, 0)
-            
     except Exception as e:
         print(f"Error during ADS generation: {str(e)}")
-        print("Debug info:")
-        if 'stats' in locals():
-            print("Stats keys:", stats.keys())
-            for k, v in stats.items():
-                print(f"{k}: type={type(v)}")
         raise
 
-@partial(jax.jit, static_argnames=('apply_fn', 'max_length'))
+# @partial(jax.jit, static_argnames=('apply_fn', 'max_length'))
 def generate_sequence(params, apply_fn, input_ids, key, max_length=20, temperature=1.0):
     """Generate sequence using regular sampling."""
     batch_size = input_ids.shape[0]
@@ -319,12 +306,12 @@ def main():
     # After model is loaded, get vocab size
     vocab_size = config.vocab_size
     
-    # Prepare input
-    prompt = "Once upon a time"
-    tokenizer_output = tokenizer(prompt, return_tensors="jax")
+    # Prepare input with batch size of 4
+    prompts = ["Once upon a time"] * 7  # Create 4 copies of the prompt
+    tokenizer_output = tokenizer(prompts, return_tensors="jax", padding=True)
     input_ids = tokenizer_output['input_ids']
     
-    # Test ADS generation
+    # Test ADS generation with batched input
     test_ads_generation(params, apply_fn, input_ids, tokenizer, vocab_size)
 
 if __name__ == "__main__":
