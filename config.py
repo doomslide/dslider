@@ -1,11 +1,12 @@
 import jax.numpy as jnp
 from typing import NamedTuple
 from dataclasses import dataclass
+from jax.tree_util import register_pytree_node_class
+
 # Constants
 MIN_TEMP = 1e-4
 MAX_TEMP = 1e4
 EPS = 1e-8
-
 
 @dataclass(frozen=True, eq=True)
 class ADSConfig:
@@ -25,12 +26,32 @@ class ADSConfig:
     entropy_b: float
     entropy_c: float
     entropy_d: float
-    dirichlet_d: float
-    dirichlet_e: float
+    dirichlet_a: float
+    dirichlet_b: float
+    token_outlier_threshold: jnp.ndarray 
     token_cross_ent_naked_coeff: float
+    token_outlier_k: int # still very interesting for k=1
+    token_outlier_emwa_weight: float
+    token_outlier_emwa_bias: float
+    token_outlier_a: float 
+    token_outlier_b: float 
+    token_outlier_c: float 
+    token_outlier_d: float 
+    token_outlier_threshold_bias: float
 
     def __hash__(self):
         return hash(tuple(getattr(self, field.name) for field in self.__dataclass_fields__.values()))
+    
+    def tree_flatten(self):
+        """For JAX pytree handling"""
+        return (tuple(getattr(self, field.name) for field in self.__dataclass_fields__.values()), None)
+    
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        """For JAX pytree handling"""
+        return cls(*children)
+
+register_pytree_node_class(ADSConfig)
 
 # Add default ADS config after the existing constants
 DEFAULT_ADS_CONFIG = ADSConfig(
@@ -50,11 +71,19 @@ DEFAULT_ADS_CONFIG = ADSConfig(
     entropy_b=0.0,
     entropy_c=0.0,
     entropy_d=0.0,
-    dirichlet_d=1.0,
-    dirichlet_e=0.0,
-    token_cross_ent_naked_coeff=0.1
+    dirichlet_a=1.0,
+    dirichlet_b=0.0,
+    token_cross_ent_naked_coeff=0.1,
+    toekn_outlier_k=3,
+    token_outlier_emwa_weight=0.6,
+    token_outlier_emwa_bias=2.0,
+    token_outlier_a=0.4,
+    token_outlier_b=0.6,
+    token_outlier_c=0.5,
+    token_outlier_d=0.2,
+    token_outlier_threshold_bias=0.3,
 )
 
 CACHE_DIR = '/home/cloudforest/Weights'
-MODEL_NAME = "meta-llama/Llama-3.2-1B"
+MODEL_NAME = "HuggingFaceTB/SmolLM-360M"
 HF_TOKEN = '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'

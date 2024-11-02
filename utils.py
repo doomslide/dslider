@@ -142,7 +142,6 @@ def temp_tune(
             jnp.maximum(T - delta_T, T / 2)
         )        
         return (new_T, iters + 1, new_converged), None
-
     init_state = (
         jnp.full((batch_size,), T_init, dtype=logits.dtype),
         jnp.zeros(batch_size, dtype=jnp.int32),
