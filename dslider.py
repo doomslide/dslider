@@ -5,27 +5,7 @@ from functools import partial
 from typing import NamedTuple, Tuple
 from utils import temp_tune, fit_dirichlet
 from rich import print
-from config import ADSConfig, EPS, MIN_TEMP, MAX_TEMP
-
-class ADSState(NamedTuple):
-    """State maintained by the Adaptive Dirichlet Sampler"""
-    emwa_dir: jnp.ndarray
-    emwa_logp_dir_supp: jnp.ndarray
-    emwa_temp: jnp.ndarray
-
-    emwa_ent_scaffold: jnp.ndarray
-    emwa_ent_naked: jnp.ndarray
-    emwa_varent_scaffold: jnp.ndarray
-    emwa_varent_naked: jnp.ndarray
-
-    token_cross_ent_scaffold: jnp.ndarray
-    token_cross_ent_naked: jnp.ndarray
-    token_cross_var_scaffold: jnp.ndarray
-    token_cross_var_naked: jnp.ndarray
-    
-    emwa_dir_ent: jnp.ndarray
-
-    emwa_topk_ent_naked: jnp.ndarray
+from config import DSConfig, EPS, MIN_TEMP, MAX_TEMP
 
 @jax.jit
 def kl_divergence(logp: jnp.ndarray, logq: jnp.ndarray) -> jnp.ndarray:
@@ -35,24 +15,44 @@ def kl_divergence(logp: jnp.ndarray, logq: jnp.ndarray) -> jnp.ndarray:
 
 @jax.jit
 def ent_varent(logp: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Compute entropy and standard deviation from log probabilities.
-    
-    Args:
-        logp: Log probabilities of shape (..., K)
-        
-    Returns:
-        ent: -∑ᵢ pᵢ log(pᵢ) of shape (...)
-        std: √∑ᵢ pᵢ (ent + log(pᵢ))² of shape (...)
-    """
+    """Compute entropy and variance from log probabilities."""
     p = jnp.exp(logp)
-    ent = -jnp.sum(p * logp, axis=-1)   
-    varent = jnp.sum(p * (ent[:, None] + logp)**2, axis=-1)
+    ent = -jnp.sum(p * logp, axis=-1)
+    diff = logp + ent[:, None]  # broadcasting
+    varent = jnp.sum(p * diff**2, axis=-1)
     return ent, varent
+
+@jax.jit
+def dirichlet_expectation(alpha: jnp.ndarray) -> jnp.ndarray:
+    """Compute the expectation E[X|X~Dir(alpha)]"""
+    alpha_sum = jnp.sum(alpha, axis=-1, keepdims=True)
+    return alpha / alpha_sum
 
 @jax.jit
 def sample_dirichlet(key: jax.random.PRNGKey, alpha: jnp.ndarray) -> jnp.ndarray:
     """Sample from a Dirichlet distribution."""
-    return jax.random.dirichlet(key, alpha)
+    gamma_samples = jax.random.gamma(
+        key, 
+        alpha,
+        shape=alpha.shape
+    )
+    return gamma_samples / jnp.sum(gamma_samples, axis=-1, keepdims=True)
+
+class DSState(NamedTuple):
+    """State maintained by the Adaptive Dirichlet Sampler"""
+    emwa_dir: jnp.ndarray
+    emwa_logp_dir_supp: jnp.ndarray
+    emwa_temp: jnp.ndarray
+    emwa_ent_scaffold: jnp.ndarray
+    emwa_ent_naked: jnp.ndarray
+    emwa_varent_scaffold: jnp.ndarray
+    emwa_varent_naked: jnp.ndarray
+    token_cross_ent_scaffold: jnp.ndarray
+    token_cross_ent_naked: jnp.ndarray
+    token_cross_var_scaffold: jnp.ndarray
+    token_cross_var_naked: jnp.ndarray
+    emwa_dir_ent: jnp.ndarray
+    emwa_topk_ent_naked: jnp.ndarray
 
 @jax.jit
 def dirichlet_expectation(alpha: jnp.ndarray) -> jnp.ndarray:
@@ -108,10 +108,10 @@ def dirichlet_expected_varentropy(alpha: jnp.ndarray) -> jnp.ndarray:
     return jnp.sum(expected_x * squared_plus_deriv, axis=-1)
 
 
-# @partial(jax.jit, static_argnames=('config', 'dtype'))
-def initialize_state(bsz: int, vsz: int, config: ADSConfig, dtype=jnp.bfloat16) -> ADSState:
-    """Initialize the ADSState with specified dtype."""
-    state = ADSState(
+@partial(jax.jit, static_argnames=('bsz', 'vsz', 'config', 'dtype'))
+def initialize_state(bsz: int, vsz: int, config: DSConfig, dtype=jnp.bfloat16) -> DSState:
+    """Initialize the DSState with specified dtype."""
+    state = DSState(
         emwa_dir=jnp.ones((bsz, config.dirichlet_support.size), dtype=dtype),
         emwa_logp_dir_supp=jnp.zeros((bsz, config.dirichlet_support.size), dtype=dtype),
         emwa_temp=jnp.ones((bsz,), dtype=dtype),
@@ -131,14 +131,14 @@ def initialize_state(bsz: int, vsz: int, config: ADSConfig, dtype=jnp.bfloat16) 
     )
     return state
 
-# @jax.jit
+@partial(jax.jit, static_argnames=('config',))
 def adaptive_dirichlet_step(
     key: jax.random.PRNGKey,
-    state: ADSState,
+    state: DSState,
     logits: jnp.ndarray,
-    config: ADSConfig,
+    config: DSConfig,
     wild: bool = False
-) -> Tuple[ADSState, jnp.ndarray]:
+) -> Tuple[DSState, jnp.ndarray]:
     """Single step of the Adaptive Dirichlet Sampler."""
     dtype = logits.dtype
     bsz, _ = logits.shape
@@ -170,15 +170,7 @@ def adaptive_dirichlet_step(
         state.emwa_varent_scaffold,
         state.emwa_varent_naked
     ])).T # TODO: add dirichlet expected std...
-    # First compute outlier threshold from state variables - shape (bsz,)
-    outlier_threshold = (
-        jnp.einsum('bi,ij,bj->b', state_ent, config.outlier_threshold.bilinear, state_std) +
-        jnp.einsum('bi,i->b', state_ent, config.outlier_threshold.linear_state_ent) +
-        jnp.einsum('bi,i->b', state_std, config.outlier_threshold.linear_state_std) +
-        naked_ent * config.outlier_threshold.linear_naked_ent +
-        naked_varent * config.outlier_threshold.linear_naked_varent +
-        config.outlier_threshold.bias
-    )
+    outlier_threshold = compute_outlier_threshold(state_ent, state_std, naked_ent, naked_varent, config)
     outlier_mask = outlier_threshold > 0
     # extract topk
     topk_logits, topk_indices = jax.lax.top_k(naked_log_probs, config.outlier_topk)
@@ -219,21 +211,15 @@ def adaptive_dirichlet_step(
     # update emwa temperature
     new_emwa_temp = config.emwa_temp_coeff * temp + (1 - config.emwa_temp_coeff) * state.emwa_temp
     """
-    scale log probabilities and update emwa logp on dirichlet support
+    tune temperature and update emwa logp on dirichlet support
     """
     # scale log probabilities
     tuned_logprobs = normalize_logits(naked_log_probs / jnp.clip(temp[:, None], MIN_TEMP, MAX_TEMP))
-    # update emwa logp on dirichlet support
-    dir_support_logp = normalize_logits(tuned_logprobs[:, config.dirichlet_support])
-    kl = kl_divergence(dir_support_logp, state.emwa_logp_dir_supp)
-    emwa_logp_coeff = (config.emwa_logp_base ** (-config.emwa_logp_exp_factor / (kl + EPS)))[:, None]
-    new_emwa_logp_dir_sup = emwa_logp_coeff * dir_support_logp + (1 - emwa_logp_coeff) * state.emwa_logp_dir_supp
     """
     update emwa logp and dirichlet parameters
     """    
-    # update Dirichlet parameters
-    new_dir_params, _, _ = fit_dirichlet(new_emwa_logp_dir_sup)
-    new_emwa_dir = config.emwa_dir_coeff * new_dir_params + (1 - config.emwa_dir_coeff) * state.emwa_dir
+    dir_support_logp = normalize_logits(tuned_logprobs[:, config.dirichlet_support])
+    new_emwa_dir, new_emwa_logp_dir_sup = update_dirichlet_params(dir_support_logp, state, config)
     """
     update Dirichlet entropy
     """
@@ -251,13 +237,11 @@ def adaptive_dirichlet_step(
     dir_expectation = dirichlet_expectation(state.emwa_dir)
     kl_div = dirichlet_expected_entropy(state.emwa_dir) - jnp.sum(dir_expectation * dir_support_logp, axis=-1) 
     perturb_coeff = 1 - jnp.pow(config.perturb_base_coeff, - config.perturb_exp_coeff * (1 / (kl_div + EPS)))
-    
     # Calculate interpolated probabilities for the support tokens
     interpolated_probs = (
         perturb_coeff[:, None] * dir_expectation + 
         (1 - perturb_coeff[:, None]) * jnp.exp(dir_support_logp)
     )
-    
     # For use_dirichlet case: sample from support space then map back
     interpolated_choices = jnp.argmax(interpolated_probs, axis=-1)
     dirichlet_tokens = jnp.take(config.dirichlet_support, interpolated_choices)
@@ -267,7 +251,7 @@ def adaptive_dirichlet_step(
     """
     if wild:
         # sample from random dirichlet distributed
-        sampled_probs = sample_dirichlet(key, new_dir_params)
+        sampled_probs = sample_dirichlet(key, new_emwa_dir)
         ood_choices = jax.random.categorical(key, jnp.log(sampled_probs + EPS))
         ood_tokens = jnp.take(config.dirichlet_support, ood_choices)
     else:
@@ -301,21 +285,22 @@ def adaptive_dirichlet_step(
         config
     )
     # assemble new state
-    new_state = ADSState(
+    new_state = DSState(
         emwa_dir=new_emwa_dir,
         emwa_logp_dir_supp=new_emwa_logp_dir_sup,
         emwa_temp=new_emwa_temp,
+        emwa_ent_scaffold=new_emwa_ent_scaffold,
+        emwa_ent_naked=new_emwa_ent_naked,
+        emwa_varent_scaffold=new_emwa_varent_scaffold,
+        emwa_varent_naked=new_emwa_varent_naked,
         token_cross_ent_scaffold=new_token_cross_ent_scaffold,
         token_cross_ent_naked=new_token_cross_ent_naked,
-        token_cross_var_naked=new_token_cross_var_scaffold,
-        token_cross_var_scaffold=new_token_cross_var_naked,
+        token_cross_var_scaffold=new_token_cross_var_scaffold,
+        token_cross_var_naked=new_token_cross_var_naked,
         emwa_dir_ent=new_emwa_dir_ent,
-        emwa_ent_scaffold=new_emwa_ent_scaffold,
-        emwa_varent_scaffold=new_emwa_varent_scaffold,
-        emwa_ent_naked=new_emwa_ent_naked,
-        emwa_varent_naked=new_emwa_varent_naked,
-        emwa_topk_ent_naked=new_emwa_topk_ent_naked,
+        emwa_topk_ent_naked=new_emwa_topk_ent_naked
     )
+
     return new_state, output_tokens, naked_ent, naked_varent, scaffold_ent, scaffold_varent, naked_token_logprob, scaffold_token_logprob
 
 @jax.jit
@@ -326,10 +311,10 @@ def normalize_logits(logits: jnp.ndarray) -> jnp.ndarray:
 
 @jax.jit
 def update_token_cross_entropies(
-    state: ADSState,
+    state: DSState,
     scaffold_token_logprob: jnp.ndarray,
     naked_token_logprob: jnp.ndarray,
-    config: ADSConfig
+    config: DSConfig
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Update token cross entropy statistics."""
     token_cross_ent_scaffold = (
@@ -354,4 +339,23 @@ def update_token_cross_entropies(
         token_cross_var_scaffold,
         token_cross_var_naked
     )
+
+@partial(jax.jit, static_argnames=('config',))
+def compute_outlier_threshold(state_ent, state_std, naked_ent, naked_varent, config):
+    return (
+        jnp.einsum('bi,ij,bj->b', state_ent, config.outlier_threshold.bilinear, state_std) +
+        jnp.einsum('bi,i->b', state_ent, config.outlier_threshold.linear_state_ent) +
+        jnp.einsum('bi,i->b', state_std, config.outlier_threshold.linear_state_std) +
+        naked_ent * config.outlier_threshold.linear_naked_ent +
+        naked_varent * config.outlier_threshold.linear_naked_varent +
+        config.outlier_threshold.bias
+    )
+
+@partial(jax.jit, static_argnames=('config',))
+def update_dirichlet_params(dir_support_logp, state, config):
+    kl = kl_divergence(dir_support_logp, state.emwa_logp_dir_supp)
+    emwa_logp_coeff = (config.emwa_logp_base ** (-config.emwa_logp_exp_factor / (kl + EPS)))[:, None]
+    new_emwa_logp_dir_sup = emwa_logp_coeff * dir_support_logp + (1 - emwa_logp_coeff) * state.emwa_logp_dir_supp
+    new_dir_params, _, _ = fit_dirichlet(new_emwa_logp_dir_sup)
+    return new_dir_params, new_emwa_logp_dir_sup
 
